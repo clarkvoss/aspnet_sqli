@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-ASP.NET SQLi Tester — generic, request-file mode
-Works on any ASP.NET target: Web Forms, MVC, Web API.
-Handles VIEWSTATE/EVENTVALIDATION token refresh automatically.
-Routes all traffic through Burp for full visibility.
+aspnet_sqli.py — ASP.NET SQL Injection Tester
+Supports single request files and Burp XML exports.
+Handles VIEWSTATE/EVENTVALIDATION refresh automatically.
+Routes all traffic through Burp Suite.
 
 Usage:
-    python3 aspnet_sqli.py -r request.txt -p payloads.txt [options]
+    # Single request, single param
+    python3 aspnet_sqli.py -r req.txt -p payloads.txt
 
-Save your request from Burp: right-click → Save item, or paste raw
-HTTP request (including headers and body) into a .txt file.
+    # Single request, auto-rotate through all params
+    python3 aspnet_sqli.py -r req.txt -p payloads.txt --rotate-params
+
+    # Burp XML export, auto-rotate all params in every POST request
+    python3 aspnet_sqli.py -x burp_export.xml -p payloads.txt --rotate-params
 """
 
 import argparse
+import base64
+import html as htmlmod
 import re
 import sys
 import time
 import urllib.parse
-import html as htmlmod
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -43,7 +49,26 @@ def cyan(s):   return f"{C.CYAN}{s}{C.RESET}"
 def bold(s):   return f"{C.BOLD}{s}{C.RESET}"
 
 
-# ── Raw request parser ────────────────────────────────────────────────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
+DEFAULT_TOKEN_FIELDS = [
+    "__VIEWSTATE",
+    "__EVENTVALIDATION",
+    "__VIEWSTATEGENERATOR",
+    "__EVENTTARGET",
+    "__EVENTARGUMENT",
+]
+
+# Params that are never worth injecting into
+SKIP_PARAM_SUFFIXES = (
+    "$ctl08",   # submit buttons
+    "$Button",
+    "$Submit",
+    "DXScript",
+    "DXCss",
+)
+
+
+# ── Parsed request ────────────────────────────────────────────────────────────
 @dataclass
 class ParsedRequest:
     method:  str
@@ -53,19 +78,23 @@ class ParsedRequest:
     headers: dict
     cookies: dict
     body:    str
-    params:  dict   # decoded body params
+    params:  dict
+    label:   str = ""   # human-readable source label for reporting
 
 
-def parse_request_file(path: str, scheme: str = "https") -> ParsedRequest:
-    with open(path, "rb") as f:
-        raw = f.read().decode("utf-8", errors="replace")
+def full_url(req: ParsedRequest) -> str:
+    return f"{req.scheme}://{req.host}{req.path}"
 
+
+def _parse_raw_request(raw: str, scheme: str = "https",
+                        label: str = "") -> ParsedRequest:
+    """Parse a raw HTTP request string into a ParsedRequest."""
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     head, body = (raw.split("\n\n", 1) + [""])[:2]
 
     lines = head.splitlines()
     parts = lines[0].strip().split()
-    method = parts[0].upper()
+    method = parts[0].upper() if parts else "GET"
     path   = parts[1] if len(parts) > 1 else "/"
 
     headers = {}
@@ -84,7 +113,8 @@ def parse_request_file(path: str, scheme: str = "https") -> ParsedRequest:
             k, v = part.split("=", 1)
             cookies[k.strip()] = v.strip()
 
-    for auto in ("Content-Length", "Content-Type", "Connection"):
+    for auto in ("Content-Length", "Content-Type", "Connection",
+                 "Accept-Encoding"):
         headers.pop(auto, None)
 
     body = body.strip()
@@ -93,34 +123,98 @@ def parse_request_file(path: str, scheme: str = "https") -> ParsedRequest:
         for kv in body.split("&"):
             if "=" in kv:
                 k, v = kv.split("=", 1)
-                params[urllib.parse.unquote_plus(k)] = urllib.parse.unquote_plus(v)
+                params[urllib.parse.unquote_plus(k)] = \
+                    urllib.parse.unquote_plus(v)
             else:
                 params[urllib.parse.unquote_plus(kv)] = ""
 
     return ParsedRequest(
         method=method, path=path, host=host, scheme=scheme,
-        headers=headers, cookies=cookies, body=body, params=params,
+        headers=headers, cookies=cookies, body=body,
+        params=params, label=label or path,
     )
 
 
-def full_url(req: ParsedRequest) -> str:
-    return f"{req.scheme}://{req.host}{req.path}"
+def parse_request_file(path: str, scheme: str = "https") -> ParsedRequest:
+    with open(path, "rb") as f:
+        raw = f.read().decode("utf-8", errors="replace")
+    return _parse_raw_request(raw, scheme=scheme, label=path)
 
 
-# ── Token extraction — configurable field names ───────────────────────────────
-DEFAULT_TOKEN_FIELDS = [
-    "__VIEWSTATE",
-    "__EVENTVALIDATION",
-    "__VIEWSTATEGENERATOR",
-]
+# ── Burp XML parser ───────────────────────────────────────────────────────────
+def parse_burp_xml(xml_path: str,
+                   methods: Optional[list[str]] = None,
+                   min_params: int = 1) -> list[ParsedRequest]:
+    """
+    Parse a Burp Suite XML export (Save items → XML).
+    Returns POST requests that have at least min_params body params.
+    """
+    methods = [m.upper() for m in (methods or ["POST", "PUT", "PATCH"])]
 
+    try:
+        tree = ET.parse(xml_path)
+    except ET.ParseError as e:
+        print(red(f"[!] Failed to parse XML: {e}"))
+        sys.exit(1)
+
+    root = tree.getroot()
+    requests_found = []
+    items = root.findall("item")
+
+    print(f"[*] Burp XML: {len(items)} items found in {xml_path}")
+
+    for i, item in enumerate(items, 1):
+        # Pull metadata
+        method   = (item.findtext("method")   or "").upper()
+        protocol = (item.findtext("protocol") or "https").lower()
+        host     = (item.findtext("host")     or "")
+        path     = (item.findtext("path")     or "/")
+
+        if method not in methods:
+            continue
+
+        # Decode request
+        req_el = item.find("request")
+        if req_el is None or not req_el.text:
+            continue
+
+        raw_bytes = req_el.text.strip()
+        if req_el.get("base64") == "true":
+            try:
+                raw_bytes = base64.b64decode(raw_bytes).decode(
+                    "utf-8", errors="replace")
+            except Exception:
+                continue
+        else:
+            raw_bytes = raw_bytes
+
+        label = f"item#{i} {method} {host}{path}"
+        req   = _parse_raw_request(raw_bytes, scheme=protocol, label=label)
+
+        # Override host/scheme from XML metadata if request line is missing them
+        if not req.host:
+            req.host   = host
+            req.scheme = protocol
+
+        if len(req.params) < min_params:
+            continue
+
+        requests_found.append(req)
+
+    print(f"[*] {len(requests_found)} {'/'.join(methods)} requests "
+          f"with ≥{min_params} body params\n")
+    return requests_found
+
+
+# ── Token extraction ──────────────────────────────────────────────────────────
 def extract_tokens(html_text: str, token_fields: list[str]) -> dict:
     tokens = {}
     for f in token_fields:
-        # Try name before value, then value before name
         for pattern in [
-            rf'<input[^>]+name=["\']?{re.escape(f)}["\']?[^>]+value=["\']([^"\']*)["\']',
-            rf'<input[^>]+value=["\']([^"\']*)["\'][^>]+name=["\']?{re.escape(f)}["\']?',
+            rf'<input[^>]+name=["\']?{re.escape(f)}["\']?[^>]+'
+            rf'value=["\']([^"\']*)["\']',
+            rf'<input[^>]+value=["\']([^"\']*)["\'][^>]+'
+            rf'name=["\']?{re.escape(f)}["\']?',
         ]:
             m = re.search(pattern, html_text, re.IGNORECASE)
             if m:
@@ -134,20 +228,41 @@ def get_fresh_tokens(session: requests.Session,
                      token_fields: list[str],
                      timeout: int,
                      verify: bool) -> Optional[dict]:
+    if not token_fields:
+        return {}
     try:
         r = session.get(
             full_url(req), headers=req.headers,
             timeout=timeout, verify=verify, allow_redirects=True,
         )
-        tokens = extract_tokens(r.text, token_fields)
-        if token_fields and not any(tokens.values()):
-            print(yellow(f"[!] No tokens found in GET response — "
-                         f"page may require auth or URL is wrong"))
-            return None
-        return tokens
+        return extract_tokens(r.text, token_fields)
     except requests.RequestException as e:
-        print(red(f"[!] Token refresh GET failed: {e}"))
+        print(red(f"[!] Token refresh failed: {e}"))
         return None
+
+
+# ── Injectable param discovery ────────────────────────────────────────────────
+def get_injectable_params(req: ParsedRequest,
+                           token_fields: list[str],
+                           extra_skip: Optional[list[str]] = None) -> list[str]:
+    """
+    Return body params worth testing — excludes tokens, submit buttons,
+    empty params, and any user-specified skips.
+    """
+    skip_exact = set(token_fields) | set(extra_skip or [])
+
+    injectable = []
+    for name, value in req.params.items():
+        if name in skip_exact:
+            continue
+        if any(name.endswith(s) for s in SKIP_PARAM_SUFFIXES):
+            continue
+        # Skip params that look like pure ASP.NET infrastructure
+        if name.startswith("DX"):
+            continue
+        injectable.append(name)
+
+    return injectable
 
 
 # ── Request builder ───────────────────────────────────────────────────────────
@@ -156,10 +271,6 @@ def build_body(base_params: dict,
                payload: str,
                mirror_param: Optional[str] = None,
                overrides: Optional[dict] = None) -> dict:
-    """
-    Clone base params, apply static overrides, inject payload.
-    Optionally mirrors payload into a second param (e.g. ConfirmPassword).
-    """
     p = dict(base_params)
     if overrides:
         p.update(overrides)
@@ -173,57 +284,51 @@ def build_body(base_params: dict,
 def extract_hint(body: str) -> str:
     decoded = htmlmod.unescape(body)
 
-    # Priority 1: MSSQL conversion error — contains extracted data
-    m = re.search(
-        r"Conversion failed when converting (?:the )?(?:nvarchar|varchar|"
-        r"uniqueidentifier|datetime|ntext|text) value '([^']{1,500})' to data type",
-        decoded, re.IGNORECASE
-    )
-    if m:
-        return f"EXTRACTED: {m.group(1)}"
+    checks = [
+        # MSSQL conversion error — contains extracted data
+        (r"Conversion failed when converting (?:the )?(?:nvarchar|varchar|"
+         r"uniqueidentifier|datetime|ntext|text) value '([^']{1,500})'"
+         r" to data type",
+         lambda m: f"EXTRACTED(MSSQL): {m.group(1)}"),
 
-    # Priority 2: MySQL extraction pattern
-    m = re.search(
-        r"XPATH syntax error: '([^']{1,300})'",
-        decoded, re.IGNORECASE
-    )
-    if m:
-        return f"EXTRACTED(MySQL): {m.group(1)}"
+        # MySQL XPATH extraction
+        (r"XPATH syntax error: '([^']{1,300})'",
+         lambda m: f"EXTRACTED(MySQL): {m.group(1)}"),
 
-    # Priority 3: Other actionable SQL errors
-    m = re.search(
-        r"(Incorrect syntax near|Unclosed quotation mark|"
-        r"arithmetic overflow|Cannot convert|Invalid column name|"
-        r"Invalid object name|ORA-\d{4,5}|"
-        r"You have an error in your SQL syntax|"
-        r"supplied argument is not a valid MySQL|"
-        r"pg_query\(\)|PostgreSQL)[^\n<]{0,200}",
-        decoded, re.IGNORECASE
-    )
-    if m:
-        return m.group(0).strip()
+        # Oracle
+        (r"(ORA-\d{4,5}[^\n<]{0,150})",
+         lambda m: m.group(1).strip()),
 
-    # Priority 4: Request validation (ASP.NET input filter — not SQLi)
-    m = re.search(
-        r"A potentially dangerous Request\.Form value",
-        decoded, re.IGNORECASE
-    )
-    if m:
-        return "[ASP.NET RequestValidation — encode payload or use --no-request-validation]"
+        # PostgreSQL
+        (r"(ERROR:\s+[^\n<]{0,150})",
+         lambda m: m.group(1).strip()),
 
-    # Priority 5: Generic exception fallback
-    m = re.search(
-        r"(SqlException|OleDbException|HttpRequestValidationException)"
-        r"[^\n<]{0,120}",
-        decoded, re.IGNORECASE
-    )
-    if m:
-        return f"[noise] {m.group(0).strip()}"
+        # ASP.NET RequestValidation blocker
+        (r"A potentially dangerous Request\.Form value",
+         lambda m: "[ASP.NET RequestValidation blocked — "
+                   "CHAR-encode payload or URL-encode <> chars]"),
 
+        # Generic SQL syntax errors
+        (r"(Incorrect syntax near|Unclosed quotation mark|"
+         r"arithmetic overflow|Invalid column name|Invalid object name|"
+         r"You have an error in your SQL syntax|"
+         r"supplied argument is not a valid MySQL)[^\n<]{0,200}",
+         lambda m: m.group(0).strip()),
+
+        # Fallback
+        (r"(SqlException|OleDbException|HttpRequestValidationException)"
+         r"[^\n<]{0,120}",
+         lambda m: f"[noise] {m.group(0).strip()}"),
+    ]
+
+    for pattern, formatter in checks:
+        m = re.search(pattern, decoded, re.IGNORECASE)
+        if m:
+            return formatter(m)
     return ""
 
 
-# ── Single injection ──────────────────────────────────────────────────────────
+# ── Single HTTP injection ─────────────────────────────────────────────────────
 def inject(session: requests.Session,
            req: ParsedRequest,
            params: dict,
@@ -231,7 +336,7 @@ def inject(session: requests.Session,
            verify: bool) -> tuple[int, int, int, str, str]:
     try:
         t0 = time.time()
-        r = session.request(
+        r  = session.request(
             method=req.method, url=full_url(req),
             headers=req.headers, data=params,
             timeout=timeout, verify=verify, allow_redirects=False,
@@ -248,7 +353,6 @@ def inject(session: requests.Session,
 # ── Baseline ──────────────────────────────────────────────────────────────────
 def confirm_baseline(session, req, token_fields, baseline_string,
                      timeout, verify) -> Optional[tuple[int, int]]:
-    print(bold("\n[*] Confirming baseline (original request, no injection)..."))
     tokens = get_fresh_tokens(session, req, token_fields, timeout, verify)
     if tokens is None:
         return None
@@ -258,14 +362,14 @@ def confirm_baseline(session, req, token_fields, baseline_string,
 
     try:
         t0 = time.time()
-        r = session.request(
+        r  = session.request(
             method=req.method, url=full_url(req),
             headers=req.headers, data=params,
             timeout=timeout, verify=verify, allow_redirects=False,
         )
         elapsed = int((time.time() - t0) * 1000)
     except requests.RequestException as e:
-        print(red(f"    [!] Baseline failed: {e}"))
+        print(red(f"    [!] Baseline request failed: {e}"))
         return None
 
     sc = r.status_code
@@ -274,20 +378,13 @@ def confirm_baseline(session, req, token_fields, baseline_string,
     print(f"    Status : {sc_str}  |  Size : {sz}b  |  Time : {elapsed}ms")
 
     if sc >= 500:
-        print(red(
-            "\n    [!] Baseline returned 500 — session cookies are likely expired.\n"
-            "    [!] Re-save the request from Burp and rerun."
-        ))
+        print(red("    [!] Baseline 500 — cookies likely expired. Re-save request."))
         return None
 
     if baseline_string and baseline_string not in r.text:
-        print(yellow(
-            f"\n    [!] Baseline string not found: '{baseline_string}'\n"
-            "    [!] Update --baseline-string to text present in this response."
-        ))
-        # Don't abort — show what IS in the response to help pick a string
-        snippet = r.text[:500].replace("\n", " ")
-        print(yellow(f"    [!] Response preview: {snippet[:200]}"))
+        snippet = r.text[:300].replace("\n", " ")
+        print(yellow(f"    [!] Baseline string '{baseline_string}' not found."))
+        print(yellow(f"    [!] Preview: {snippet[:200]}"))
         return None
 
     label = f"'{baseline_string}'" if baseline_string else "HTTP response"
@@ -295,126 +392,38 @@ def confirm_baseline(session, req, token_fields, baseline_string,
     return sc, sz
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def run(args):
-    proxy   = None if args.no_proxy else args.proxy
-    proxies = {"http": proxy, "https": proxy} if proxy else {}
-    scheme  = "http" if args.http else "https"
-
-    # Parse token fields
-    token_fields = [t.strip() for t in args.token_fields.split(",") if t.strip()] \
-                   if args.token_fields else DEFAULT_TOKEN_FIELDS
-
-    # Parse static overrides
-    overrides = {}
-    for kv in args.set_param:
-        if "=" in kv:
-            k, v = kv.split("=", 1)
-            overrides[k] = v
-        else:
-            print(yellow(f"  [!] Ignoring malformed --set-param: {kv}"))
-
-    print(bold(cyan("\n=== ASP.NET SQLi Tester ===")))
-
-    req = parse_request_file(args.request, scheme=scheme)
-
-    print(f"  Target       : {full_url(req)}")
-    print(f"  Method       : {req.method}")
-    print(f"  Inject param : {args.inject_param}")
-    print(f"  Mirror param : {args.mirror_param or 'none'}")
-    print(f"  Token fields : {token_fields}")
-    print(f"  Payload file : {args.payloads}")
-    print(f"  Proxy        : {proxy or 'none'}")
-    if overrides:
-        print(f"  Overrides    : {overrides}")
-
-    if args.inject_param not in req.params:
-        print(yellow(
-            f"\n  [!] '{args.inject_param}' not in request body.\n"
-            f"  [!] Available: {list(req.params.keys())}\n"
-            f"  [!] Check spelling — use decoded names ($ not %24)."
-        ))
-
-    session = requests.Session()
-    session.cookies.update(req.cookies)
-    session.proxies.update(proxies)
-
-    # Baseline
-    baseline = confirm_baseline(
-        session, req, token_fields,
-        args.baseline_string, args.timeout, args.verify
-    )
-    if not baseline:
-        sys.exit(1)
-    baseline_status, baseline_size = baseline
-
-    # Load payloads
-    try:
-        with open(args.payloads) as f:
-            payloads = [
-                ln.strip() for ln in f
-                if ln.strip() and not ln.startswith("#")
-            ]
-    except FileNotFoundError:
-        print(red(f"[!] Payload file not found: {args.payloads}"))
-        sys.exit(1)
-
-    # Warmup phase
-    if args.warmup > 0:
-        print(bold(f"\n[*] Warming up — {args.warmup} requests "
-                   f"(payload: {repr(args.warmup_payload)})"))
-        for w in range(1, args.warmup + 1):
-            tokens = get_fresh_tokens(session, req, token_fields,
-                                      args.timeout, args.verify)
-            if not tokens:
-                continue
-            params = build_body(req.params, args.inject_param,
-                                args.warmup_payload,
-                                mirror_param=args.mirror_param,
-                                overrides=overrides)
-            params.update(tokens)
-            sc, sz, ms, _, _ = inject(session, req, params,
-                                      args.timeout, args.verify)
-            sc_str = green(str(sc)) if sc < 400 else red(str(sc))
-            delta = sz - baseline_size
-            state = "ready" if (sz != baseline_size and ms < 5000) else "init"
-            print(f"    warmup {w}/{args.warmup}  {sc_str}  {sz}b  "
-                  f"{ms}ms  Δ{delta:+d}b  [{state}]")
-            time.sleep(args.delay)
-            if state == "ready":
-                print(green("    [+] Server ready"))
-                break
-        print()
-
-    # Payload loop
-    print(bold(f"[*] Running {len(payloads)} payloads\n"))
-    print(f"{'#':<5} {'Status':<8} {'Size':<9} {'Time(ms)':<10} "
-          f"{'Result':<10} Payload")
-    print("─" * 95)
-
+# ── Payload loop for one inject param ────────────────────────────────────────
+def run_payload_loop(session, req, payloads, inject_param,
+                     baseline_status, baseline_size,
+                     token_fields, mirror_param, overrides,
+                     args) -> list[tuple]:
+    """
+    Run all payloads against inject_param.
+    Returns list of (payload_num, payload, status, size, ms, hint) hits.
+    """
     hits = []
 
     for i, payload in enumerate(payloads, 1):
         tokens = get_fresh_tokens(session, req, token_fields,
                                   args.timeout, args.verify)
-        if not tokens:
+        if tokens is None:
             print(yellow(f"  [{i:03d}] Token refresh failed — skipping"))
             continue
 
-        params = build_body(req.params, args.inject_param, payload,
-                            mirror_param=args.mirror_param,
+        params = build_body(req.params, inject_param, payload,
+                            mirror_param=mirror_param,
                             overrides=overrides)
         params.update(tokens)
 
         sc, sz, ms, hint, body = inject(session, req, params,
-                                        args.timeout, args.verify)
+                                         args.timeout, args.verify)
 
         triggered  = (sc != baseline_status) or (sz != baseline_size)
         size_delta = sz - baseline_size
         result_str = red("HIT  ") if triggered else green("clean")
         sc_str     = red(str(sc)) if sc >= 400 else green(str(sc))
-        delta_str  = f" Δ{size_delta:+d}b" if size_delta != 0 else ""
-        display_pl = (payload[:55] + "…") if len(payload) > 55 else payload
+        delta_str  = f" Δ{size_delta:+d}b" if size_delta else ""
+        display_pl = (payload[:52] + "…") if len(payload) > 52 else payload
 
         print(f"{i:<5} {sc_str:<17} {sz:<9} {ms:<10} "
               f"{result_str}  {display_pl}{delta_str}")
@@ -435,102 +444,343 @@ def run(args):
 
         time.sleep(args.delay)
 
-    # Summary
-    print("\n" + "═" * 95)
-    print(bold(f"[*] Complete — {len(hits)}/{len(payloads)} differentials\n"))
+    return hits
 
-    if hits:
-        print(bold(red(f"[!] HITS ({len(hits)}):\n")))
-        for idx, pl, sc, sz, ms, hint in hits:
-            print(f"  #{idx}  {sc} | {ms}ms | {sz}b")
-            print(f"       Payload : {pl}")
-            if hint:
-                print(f"       Hint    : {hint}")
-            print()
+
+# ── Test a single request (one or more params) ────────────────────────────────
+def test_request(session, req, payloads, args,
+                 token_fields, overrides) -> list[dict]:
+    """
+    Test one ParsedRequest. Returns list of finding dicts.
+    """
+    url = full_url(req)
+    print(bold(f"\n{'═'*95}"))
+    print(bold(f"  {req.method} {url}"))
+    print(bold(f"  Label : {req.label}"))
+    print(bold(f"{'═'*95}"))
+
+    # Determine which params to test
+    if args.rotate_params:
+        inject_params = get_injectable_params(
+            req, token_fields, extra_skip=args.skip_param)
+        if not inject_params:
+            print(yellow("  [!] No injectable params found after filtering — skipping"))
+            return []
+        print(f"  Params to test : {inject_params}")
     else:
-        print(green("[+] No differentials detected."))
+        inject_params = [args.inject_param]
+        if args.inject_param not in req.params:
+            print(yellow(f"  [!] '{args.inject_param}' not in request params — skipping"))
+            print(yellow(f"  [!] Available: {list(req.params.keys())}"))
+            return []
+
+    # Baseline
+    print(bold("\n[*] Confirming baseline..."))
+    baseline = confirm_baseline(
+        session, req, token_fields,
+        args.baseline_string, args.timeout, args.verify
+    )
+    if not baseline:
+        print(yellow("  [!] Baseline failed — skipping this request"))
+        return []
+    baseline_status, baseline_size = baseline
+
+    # Warmup
+    if args.warmup > 0:
+        print(bold(f"\n[*] Warming up ({args.warmup} requests)..."))
+        for w in range(1, args.warmup + 1):
+            tokens = get_fresh_tokens(session, req, token_fields,
+                                      args.timeout, args.verify) or {}
+            params = build_body(req.params, inject_params[0],
+                                args.warmup_payload,
+                                overrides=overrides)
+            params.update(tokens)
+            sc, sz, ms, _, _ = inject(session, req, params,
+                                       args.timeout, args.verify)
+            sc_str = green(str(sc)) if sc < 400 else red(str(sc))
+            delta  = sz - baseline_size
+            state  = "ready" if delta != 0 and ms < 5000 else "init"
+            print(f"    warmup {w}/{args.warmup}  {sc_str}  "
+                  f"{sz}b  {ms}ms  Δ{delta:+d}b  [{state}]")
+            time.sleep(args.delay)
+            if state == "ready":
+                print(green("    [+] Server ready"))
+                break
+        print()
+
+    # Run payload loop for each param
+    all_findings = []
+
+    for inject_param in inject_params:
+        mirror = args.mirror_param
+        # Auto-detect mirror for ConfirmPassword when rotating
+        if args.rotate_params and "Password" in inject_param:
+            for k in req.params:
+                if "Confirm" in k and "Password" in k:
+                    mirror = k
+                    break
+
+        print(bold(f"\n[*] Injecting → {inject_param}"
+                   + (f"  (mirror → {mirror})" if mirror else "")
+                   + f"  |  {len(payloads)} payloads"))
+        print(f"\n{'#':<5} {'Status':<8} {'Size':<9} {'Time(ms)':<10} "
+              f"{'Result':<10} Payload")
+        print("─" * 95)
+
+        hits = run_payload_loop(
+            session, req, payloads, inject_param,
+            baseline_status, baseline_size,
+            token_fields, mirror, overrides, args
+        )
+
+        print(f"\n  → {len(hits)}/{len(payloads)} hits on [{inject_param}]")
+
+        if hits:
+            for idx, pl, sc, sz, ms, hint in hits:
+                all_findings.append({
+                    "url":          url,
+                    "label":        req.label,
+                    "param":        inject_param,
+                    "payload_num":  idx,
+                    "payload":      pl,
+                    "status":       sc,
+                    "size":         sz,
+                    "ms":           ms,
+                    "hint":         hint,
+                })
+
+    return all_findings
+
+
+# ── Final summary across all requests ─────────────────────────────────────────
+def print_summary(all_findings: list[dict], total_requests: int):
+    print(bold(f"\n\n{'█'*95}"))
+    print(bold(f"  FINAL SUMMARY — {total_requests} request(s) tested"))
+    print(bold(f"{'█'*95}"))
+
+    if not all_findings:
+        print(green("\n  [+] No differentials detected across all requests.\n"))
+        return
+
+    # Group by URL + param
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for f in all_findings:
+        grouped[(f["url"], f["param"])].append(f)
+
+    print(bold(red(f"\n  [!] {len(grouped)} injectable parameter(s) found "
+                   f"across {len(set(f['url'] for f in all_findings))} "
+                   f"endpoint(s)\n")))
+
+    for (url, param), findings in grouped.items():
+        print(bold(f"  ┌─ {url}"))
+        print(bold(f"  │  Parameter : {param}"))
+        print(f"  │  Hits      : {len(findings)}")
+        for f in findings[:3]:   # show first 3 hits per param
+            print(f"  │  #{f['payload_num']:<4} {f['status']} | "
+                  f"{f['ms']}ms | {f['size']}b")
+            print(f"  │       Payload : {f['payload'][:80]}")
+            if f["hint"]:
+                print(f"  │       Hint    : {f['hint']}")
+        if len(findings) > 3:
+            print(f"  │       ... and {len(findings)-3} more hits")
+        print(f"  └{'─'*60}")
+    print()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def run(args):
+    proxy   = None if args.no_proxy else args.proxy
+    proxies = {"http": proxy, "https": proxy} if proxy else {}
+    scheme  = "http" if args.http else "https"
+
+    token_fields = [t.strip() for t in args.token_fields.split(",")
+                    if t.strip()] if args.token_fields else DEFAULT_TOKEN_FIELDS
+
+    overrides = {}
+    for kv in args.set_param:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            overrides[k] = v
+
+    print(bold(cyan("\n=== aspnet_sqli.py ===")))
+    print(f"  Proxy        : {proxy or 'none'}")
+    print(f"  Token fields : {token_fields or 'none (disabled)'}")
+    print(f"  Rotate params: {args.rotate_params}")
+    if overrides:
+        print(f"  Overrides    : {overrides}")
+
+    # Load payloads
+    try:
+        with open(args.payloads) as f:
+            payloads = [
+                ln.strip() for ln in f
+                if ln.strip() and not ln.startswith("#")
+            ]
+        print(f"  Payloads     : {len(payloads)} loaded from {args.payloads}")
+    except FileNotFoundError:
+        print(red(f"[!] Payload file not found: {args.payloads}"))
+        sys.exit(1)
+
+    # Build session
+    session = requests.Session()
+    session.proxies.update(proxies)
+
+    # Gather requests to test
+    if args.burp_xml:
+        print(f"\n[*] Parsing Burp XML: {args.burp_xml}")
+        test_requests = parse_burp_xml(
+            args.burp_xml,
+            methods=args.xml_methods.upper().split(",") if args.xml_methods else None,
+            min_params=args.min_params,
+        )
+        # Update session cookies from args if provided
+        if args.cookies:
+            for part in args.cookies.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    session.cookies.set(k.strip(), v.strip())
+    else:
+        test_requests = [parse_request_file(args.request, scheme=scheme)]
+        session.cookies.update(test_requests[0].cookies)
+
+    if not test_requests:
+        print(red("[!] No requests to test — check filters or input file."))
+        sys.exit(1)
+
+    print(f"\n[*] Testing {len(test_requests)} request(s)\n")
+
+    # Run
+    all_findings = []
+    for req in test_requests:
+        # Per-request session cookies from the request itself
+        if not args.burp_xml:
+            session.cookies.clear()
+            session.cookies.update(req.cookies)
+
+        findings = test_request(
+            session, req, payloads, args,
+            token_fields, overrides
+        )
+        all_findings.extend(findings)
+
+    # Final summary
+    print_summary(all_findings, len(test_requests))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
-        description="ASP.NET SQLi tester — generic, raw request file + Burp proxy",
+        description="ASP.NET SQLi tester — single request or Burp XML, "
+                    "with param rotation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Web Forms (default — VIEWSTATE refresh)
+  # Single request, default param
   python3 aspnet_sqli.py -r req.txt -p payloads.txt
 
-  # Mirror payload into ConfirmPassword (registration forms)
-  python3 aspnet_sqli.py -r req.txt -p payloads.txt \\
-      --mirror-param "ctl00$MainContent$ConfirmPassword"
+  # Single request, rotate all params
+  python3 aspnet_sqli.py -r req.txt -p payloads.txt --rotate-params
 
-  # MVC / Web API — no viewstate tokens
+  # Burp XML — test every POST, rotate all params
+  python3 aspnet_sqli.py -x burp.xml -p payloads.txt --rotate-params
+
+  # Burp XML — specific cookie header (if requests in XML have expired cookies)
+  python3 aspnet_sqli.py -x burp.xml -p payloads.txt --rotate-params \\
+      --cookies "ARRAffinity=abc; ASP.NET_SessionId=xyz"
+
+  # Burp XML — only test specific endpoints by filtering min params
+  python3 aspnet_sqli.py -x burp.xml -p payloads.txt --rotate-params \\
+      --min-params 3
+
+  # MVC target — custom CSRF token, no viewstate
+  python3 aspnet_sqli.py -r req.txt -p payloads.txt \\
+      --token-fields "__RequestVerificationToken" --inject-param "Password"
+
+  # Web API — no tokens at all
   python3 aspnet_sqli.py -r req.txt -p payloads.txt --token-fields ""
-
-  # Override a field for every request
-  python3 aspnet_sqli.py -r req.txt -p payloads.txt \\
-      --set-param "ctl00$MainContent$Email=safe@example.com"
-
-  # No proxy, direct to target
-  python3 aspnet_sqli.py -r req.txt -p payloads.txt --no-proxy
-
-  # HTTP target
-  python3 aspnet_sqli.py -r req.txt -p payloads.txt --http
         """
     )
-    # Required
-    ap.add_argument("-r", "--request",  required=True,
-                    help="Raw HTTP request file (saved from Burp)")
+
+    # Input — mutually exclusive
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("-r", "--request",
+                     help="Raw HTTP request file (saved from Burp)")
+    src.add_argument("-x", "--burp-xml",
+                     help="Burp Suite XML export (Save items → XML)")
+
     ap.add_argument("-p", "--payloads", required=True,
-                    help="Payload file — one payload per line, # for comments")
+                    help="Payload file — one per line, # = comment")
 
     # Injection control
     ap.add_argument("--inject-param",
                     default="ctl00$MainContent$Password",
-                    help="Body parameter to inject into")
+                    help="Param to inject into (single-request mode without --rotate-params)")
+    ap.add_argument("--rotate-params", action="store_true",
+                    help="Auto-test every injectable param in the request(s)")
+    ap.add_argument("--skip-param", metavar="PARAM", action="append",
+                    default=[],
+                    help="Param name to skip during rotation (repeatable)")
     ap.add_argument("--mirror-param", default=None,
-                    help="Copy payload into this param too (e.g. ConfirmPassword)")
+                    help="Copy payload into this param too (e.g. ConfirmPassword). "
+                         "Auto-detected for ConfirmPassword during rotation.")
     ap.add_argument("--set-param", metavar="KEY=VALUE", action="append",
                     default=[],
-                    help="Override param for every request (repeatable)")
+                    help="Override a param on every request (repeatable)")
 
     # Detection
     ap.add_argument("--baseline-string", default="",
-                    help="String expected in clean response for differential detection")
+                    help="Text expected in clean response. "
+                         "If empty, uses status+size differential only.")
 
     # Token handling
     ap.add_argument("--token-fields",
                     default=",".join(DEFAULT_TOKEN_FIELDS),
-                    help="Comma-separated hidden field names to refresh each request "
-                         "(default: ASP.NET Web Forms fields). Pass empty string to disable.")
+                    help="Hidden fields to refresh before each request. "
+                         "Pass '' to disable (MVC/API targets).")
+
+    # Burp XML options
+    ap.add_argument("--xml-methods", default="POST,PUT,PATCH",
+                    help="Comma-separated HTTP methods to extract from XML "
+                         "(default: POST,PUT,PATCH)")
+    ap.add_argument("--min-params", type=int, default=1,
+                    help="Minimum body params for a request to be tested "
+                         "from XML (default: 1)")
+    ap.add_argument("--cookies", default="",
+                    help="Cookie string to apply to all XML requests "
+                         "(overrides cookies in individual requests)")
 
     # Warmup
     ap.add_argument("--warmup", type=int, default=0,
-                    help="Requests to send before payload loop to exhaust "
-                         "server-side init (default: 0)")
+                    help="Priming requests before payload loop (default: 0)")
     ap.add_argument("--warmup-payload", default="warmup'",
-                    help="Payload to use during warmup (default: warmup')")
+                    help="Payload used during warmup (default: warmup')")
 
     # Network
-    ap.add_argument("--proxy",    default="http://127.0.0.1:8080",
-                    help="Burp proxy (default: http://127.0.0.1:8080)")
+    ap.add_argument("--proxy",    default="http://127.0.0.1:8080")
     ap.add_argument("--no-proxy", action="store_true",
-                    help="Send directly to target, bypass proxy")
+                    help="Bypass proxy, send directly to target")
     ap.add_argument("--http",     action="store_true",
                     help="Use http:// instead of https://")
     ap.add_argument("--verify",   action="store_true",
-                    help="Enable SSL verification (off by default for Burp)")
-    ap.add_argument("--timeout",  type=int, default=90,
-                    help="Request timeout in seconds (default: 90)")
+                    help="Enable SSL verification (off by default for Burp CA)")
+    ap.add_argument("--timeout",  type=int,   default=90)
     ap.add_argument("--delay",    type=float, default=0.5,
                     help="Seconds between requests (default: 0.5)")
 
     # Output
     ap.add_argument("--dump", action="store_true",
-                    help="Print response Exception Details section on every HIT")
+                    help="Print Exception Details section on every HIT")
 
     args = ap.parse_args()
+
+    # Validate
+    if not args.burp_xml and not args.request:
+        ap.error("Provide either -r (request file) or -x (Burp XML)")
+    if args.burp_xml and not args.rotate_params and not args.inject_param:
+        ap.error("With -x, use --rotate-params or --inject-param")
+
     run(args)
 
 

